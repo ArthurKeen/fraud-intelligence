@@ -27,13 +27,28 @@ pip install -r requirements.txt
 
 ## Exact commands (REMOTE)
 
-From repo root:
+From repo root — **one command** to run all three phases:
+
+```bash
+python scripts/setup_demo.py
+```
+
+Or to resume from a specific phase (e.g. if Phase 1 already completed):
+
+```bash
+python scripts/setup_demo.py --from-phase 2
+```
+
+<details>
+<summary>Individual phase commands (advanced)</summary>
 
 ```bash
 python scripts/test_phase1.py --remote-only --install-visualizer
 python scripts/test_phase2.py --remote-only
 python scripts/test_phase3.py --remote-only
 ```
+
+</details>
 
 Expected outputs:
 

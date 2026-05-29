@@ -239,6 +239,236 @@ FOR node IN @nodes
         )
 
 
+def _slugify(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", s.lower()).strip("_")
+
+
+def _upsert_query(
+    queries_col,
+    vp_query_col,
+    vp_id: str,
+    graph_name: str,
+    name: str,
+    description: str,
+    query_text: str,
+    bind_vars: Dict,
+    now: str,
+) -> str:
+    """Upsert a _queries doc and link to viewpoint via _viewpointQueries. Returns query _id."""
+    stable_key = _slugify(f"{graph_name}_{name}")
+    existing = list(queries_col.find({"_key": stable_key}))
+    if not existing:
+        existing = list(queries_col.find({"name": name, "graphId": graph_name}))
+
+    if existing:
+        existing = sorted(existing, key=lambda d: d.get("_key", ""))
+        for extra in existing[1:]:
+            try:
+                for edge in vp_query_col.find({"_to": extra["_id"]}):
+                    vp_query_col.delete(edge["_key"])
+                queries_col.delete(extra["_key"])
+            except Exception:
+                pass
+        doc = {
+            "_key": existing[0]["_key"],
+            "_id": existing[0]["_id"],
+            "graphId": graph_name,
+            "name": name,
+            "title": name,
+            "description": description,
+            "queryText": query_text,
+            "bindVariables": bind_vars,
+            "createdAt": existing[0].get("createdAt", now),
+            "updatedAt": now,
+        }
+        queries_col.replace(doc, check_rev=False)
+        query_id = existing[0]["_id"]
+    else:
+        doc = {
+            "_key": stable_key,
+            "graphId": graph_name,
+            "name": name,
+            "title": name,
+            "description": description,
+            "queryText": query_text,
+            "bindVariables": bind_vars,
+            "createdAt": now,
+            "updatedAt": now,
+        }
+        res = queries_col.insert(doc)
+        query_id = res["_id"]
+
+    if not list(vp_query_col.find({"_from": vp_id, "_to": query_id})):
+        vp_query_col.insert({"_from": vp_id, "_to": query_id, "createdAt": now, "updatedAt": now})
+    return query_id
+
+
+def install_ontology_saved_queries(db, graph_name: str, vertex_colls: Set[str], edge_colls: Set[str]) -> None:
+    """Install saved queries into the Graph Visualizer Queries panel for OntologyGraph."""
+    ensure_collection(db, "_queries", edge=False)
+    ensure_collection(db, "_viewpointQueries", edge=True)
+    queries_col = db.collection("_queries")
+    vp_query_col = db.collection("_viewpointQueries")
+    vp_id = ensure_default_viewpoint(db, graph_name)
+    now = datetime.utcnow().isoformat() + "Z"
+
+    with_clause = "WITH " + ", ".join(sorted(vertex_colls | edge_colls))
+    edge_union = "\n".join(
+        f"  (FOR d IN {ec} RETURN d)," for ec in sorted(edge_colls)
+    ).rstrip(",")
+
+    entire_query = f"""{with_clause}
+FOR e IN UNION_DISTINCT(
+{edge_union}
+)
+RETURN e"""
+    _upsert_query(
+        queries_col, vp_query_col, vp_id, graph_name,
+        "Show Entire Ontology",
+        "Load all classes, properties, and their relationships",
+        entire_query,
+        {},
+        now,
+    )
+
+    # Bound the traversal: an unbounded 1..10 ANY with no uniqueness options
+    # enumerates every path and explodes (query gets killed) even on a tiny
+    # ontology. uniqueVertices:"global" + bfs visits each node once; depth 5 is
+    # plenty to reach all properties/superclasses of a Class.
+    below_class_query = f"""{with_clause}
+FOR c IN Class
+  FILTER c._label == @className OR LIKE(c._uri, CONCAT("%#", @className), true)
+  FOR v, e IN 1..5 ANY c GRAPH "{graph_name}"
+    OPTIONS {{ uniqueVertices: "global", uniqueEdges: "path", bfs: true }}
+    RETURN DISTINCT e"""
+    _upsert_query(
+        queries_col, vp_query_col, vp_id, graph_name,
+        "Show Ontology Below Class",
+        "Show all classes and properties reachable from the selected class",
+        below_class_query,
+        {"className": "Person"},
+        now,
+    )
+
+
+def install_data_graph_saved_queries(db, graph_name: str, vertex_colls: Set[str], edge_colls: Set[str]) -> None:
+    """Install demo-aligned saved queries for DataGraph / KnowledgeGraph Queries panel."""
+    ensure_collection(db, "_queries", edge=False)
+    ensure_collection(db, "_viewpointQueries", edge=True)
+    queries_col = db.collection("_queries")
+    vp_query_col = db.collection("_viewpointQueries")
+    vp_id = ensure_default_viewpoint(db, graph_name)
+    now = datetime.utcnow().isoformat() + "Z"
+
+    with_clause = "WITH " + ", ".join(sorted(vertex_colls | edge_colls))
+
+    # UC1: Find Victor Tella (synthetic alias) — starting point for circular trading demo
+    if "Person" in vertex_colls:
+        _upsert_query(
+            queries_col, vp_query_col, vp_id, graph_name,
+            "UC1: Find Victor Tella",
+            "Locate the synthetic alias used as the starting point for the circular trading demo",
+            f"""{with_clause}
+FOR p IN Person
+  FILTER p.name == @name
+  FILTER p.isSyntheticDuplicate == true
+  SORT p._key ASC
+  LIMIT 1
+  RETURN p""",
+            {"name": "Victor Tella"},
+            now,
+        )
+
+    # UC2a: Top fan-out accounts (mule hub discovery). Return the outgoing transfer
+    # edges of the busiest source accounts so the Visualizer renders the hub + spokes.
+    if "transferredTo" in edge_colls:
+        _upsert_query(
+            queries_col, vp_query_col, vp_id, graph_name,
+            "UC2: Top Fan-Out Accounts",
+            "Find accounts with the most outgoing transfers (potential mule hubs)",
+            f"""WITH BankAccount, transferredTo
+FOR e IN transferredTo
+  COLLECT acct = e._from WITH COUNT INTO outDegree
+  SORT outDegree DESC
+  LIMIT @limit
+  FOR v, edge IN 1..1 OUTBOUND acct transferredTo
+    RETURN edge""",
+            {"limit": 3},
+            now,
+        )
+
+        # UC2b: Top fan-in accounts (collection points). Return incoming edges.
+        _upsert_query(
+            queries_col, vp_query_col, vp_id, graph_name,
+            "UC2: Top Fan-In Accounts",
+            "Find accounts with the most incoming transfers (potential collection points)",
+            f"""WITH BankAccount, transferredTo
+FOR e IN transferredTo
+  COLLECT acct = e._to WITH COUNT INTO inDegree
+  SORT inDegree DESC
+  LIMIT @limit
+  FOR v, edge IN 1..1 INBOUND acct transferredTo
+    RETURN edge""",
+            {"limit": 3},
+            now,
+        )
+
+    # UC3: Undervalued property sales (circle rate evasion). Return the
+    # property→transaction path so both nodes and the edge render on the canvas.
+    if "RealProperty" in vertex_colls and "registeredSale" in edge_colls:
+        _upsert_query(
+            queries_col, vp_query_col, vp_id, graph_name,
+            "UC3: Undervalued Property Sales",
+            "Find properties where sale value is suspiciously below the circle rate value",
+            f"""WITH RealProperty, RealEstateTransaction, registeredSale
+FOR p IN RealProperty
+  FILTER p.circleRateValue != null AND p.circleRateValue > 0
+  FOR tx, e, path IN 1..1 OUTBOUND p registeredSale
+    FILTER tx.transactionValue != null
+    LET ratio = tx.transactionValue / p.circleRateValue
+    FILTER ratio < 0.8
+    SORT ratio ASC
+    LIMIT @limit
+    RETURN path""",
+            {"limit": 5},
+            now,
+        )
+
+    # UC4: Highest-risk entities (algorithm-assisted pivot). Returns the actual
+    # Person nodes ranked by the riskScore written in Phase 3, so they render and
+    # can be expanded. (Requires Phase 3 risk scoring to have run.)
+    if "Person" in vertex_colls:
+        _upsert_query(
+            queries_col, vp_query_col, vp_id, graph_name,
+            "UC4: Highest-Risk Entities",
+            "Top people ranked by computed riskScore (requires Phase 3 analytics/risk run)",
+            f"""WITH Person
+FOR p IN Person
+  FILTER p.riskScore != null
+  SORT p.riskScore DESC
+  LIMIT @limit
+  RETURN p""",
+            {"limit": 10},
+            now,
+        )
+
+    # Account transfer chain (smoke traversal — good general starting point).
+    # Return the full 2-hop path so Person, both accounts, and the edges render.
+    if "Person" in vertex_colls and "hasAccount" in edge_colls and "transferredTo" in edge_colls:
+        _upsert_query(
+            queries_col, vp_query_col, vp_id, graph_name,
+            "Account Transfer Chain",
+            "Traverse Person → BankAccount → transfer targets (basic connectivity check)",
+            f"""WITH Person, BankAccount, hasAccount, transferredTo
+FOR p IN Person
+  FOR v, e, path IN 2..2 OUTBOUND p hasAccount, transferredTo
+    LIMIT @limit
+    RETURN path""",
+            {"limit": 10},
+            now,
+        )
+
+
 def install_canvas_actions(db, graph_name: str, vertex_colls: Set[str], edge_colls: Set[str]) -> None:
     """Install canvas actions. OntologyGraph uses ontology-only logic; others use generic logic."""
     if graph_name == "OntologyGraph":
@@ -345,6 +575,11 @@ def install_themes(db) -> None:
             print(f"[Installed Theme] {graph_name}::{theme['name']}")
 
         install_canvas_actions(db, graph_name, vertex_colls, edge_colls)
+
+        if graph_name == "OntologyGraph":
+            install_ontology_saved_queries(db, graph_name, vertex_colls, edge_colls)
+        else:
+            install_data_graph_saved_queries(db, graph_name, vertex_colls, edge_colls)
 
 
 def main() -> None:
