@@ -468,6 +468,171 @@ FOR p IN Person
             now,
         )
 
+    # ========== NEW: Indications and Warnings Queries ==========
+
+    # I&W 1.1: Circular Transaction Patterns (HEADLINE indication).
+    # Hunting query (no node selection needed): detect directed transfer cycles
+    # and return the full path so the loop renders on the canvas. Bounded depth +
+    # uniqueEdges:"path" + LIMIT keep it from exploding on background noise.
+    if "BankAccount" in vertex_colls and "transferredTo" in edge_colls:
+        _upsert_query(
+            queries_col, vp_query_col, vp_id, graph_name,
+            "[I&W] Circular Transaction Patterns",
+            "Detect closed-loop (round-trip) transfer cycles between accounts — a classic laundering indication",
+            f"""WITH BankAccount, transferredTo
+FOR start IN BankAccount
+  FOR v, e, p IN @minLen..@maxLen OUTBOUND start transferredTo
+    OPTIONS {{ uniqueEdges: "path", uniqueVertices: "none" }}
+    FILTER v._id == start._id
+    LIMIT @limit
+    RETURN p""",
+            {"minLen": 2, "maxLen": 6, "limit": 10},
+            now,
+        )
+
+    # I&W 2.3: Gateway Accounts (High In + Out Degree)
+    if "BankAccount" in vertex_colls and "transferredTo" in edge_colls:
+        _upsert_query(
+            queries_col, vp_query_col, vp_id, graph_name,
+            "[I&W] Gateway Accounts (Pass-Through Intermediaries)",
+            "Find accounts with both high inbound and outbound transfers (classic layering pattern)",
+            f"""{with_clause}
+LET analysis = (
+  FOR acct IN BankAccount
+    LET inDeg = LENGTH(FOR e IN transferredTo FILTER e._to == acct._id RETURN 1)
+    LET outDeg = LENGTH(FOR e IN transferredTo FILTER e._from == acct._id RETURN 1)
+    FILTER inDeg >= @minInDegree AND outDeg >= @minOutDegree
+    SORT (inDeg + outDeg) DESC
+    RETURN acct._id
+)
+FOR item IN analysis LIMIT @limit
+  FOR v, e, p IN 1..1 ANY item transferredTo
+    RETURN p""",
+            {"minInDegree": 3, "minOutDegree": 3, "limit": 5},
+            now,
+        )
+
+        # I&W 3.1: Rapid Inbound Bursts (collection velocity). Surfaces accounts
+        # that RECEIVE many transfers inside a single hour — a money-mule
+        # collection hub absorbing many small deposits fast. Returns the inbound
+        # edges so the burst renders.
+        _upsert_query(
+            queries_col, vp_query_col, vp_id, graph_name,
+            "[I&W] Rapid Inbound Bursts (Collection Velocity)",
+            "Find accounts receiving many transfers within a single hour (high-velocity collection — mule hub absorbing deposits)",
+            f"""{with_clause}
+FOR e IN transferredTo
+  COLLECT dst = e._to, timeWindow = DATE_TRUNC(e.timestamp, "hour") WITH COUNT INTO burstSize
+  FILTER burstSize >= @minBurstSize
+  SORT burstSize DESC, timeWindow DESC
+  LIMIT @limit
+  FOR edge IN transferredTo
+    FILTER edge._to == dst AND DATE_TRUNC(edge.timestamp, "hour") == timeWindow
+    LIMIT 60
+    RETURN edge""",
+            {"minBurstSize": 5, "limit": 3},
+            now,
+        )
+
+        # I&W 3.2: Structuring Chains (Amount Decay)
+        _upsert_query(
+            queries_col, vp_query_col, vp_id, graph_name,
+            "[I&W] Structuring Chains (Amount Decay Pattern)",
+            "Find 3-hop chains where the transfer amount decays at each hop (fee extraction / skimming). Returns the full path so the chain renders.",
+            f"""WITH BankAccount, transferredTo
+FOR start IN BankAccount
+  FOR v, e, p IN 3..3 OUTBOUND start transferredTo
+    OPTIONS {{ uniqueVertices: "path", uniqueEdges: "path" }}
+    FILTER p.edges[1].amount < p.edges[0].amount * @decay
+    FILTER p.edges[2].amount < p.edges[1].amount * @decay
+    LIMIT @limit
+    RETURN p""",
+            {"decay": 0.95, "limit": 5},
+            now,
+        )
+
+        # I&W 3.3: Round Amount Transfers
+        _upsert_query(
+            queries_col, vp_query_col, vp_id, graph_name,
+            "[I&W] Round Amount Transfers (Suspiciously Uniform)",
+            "Find large transfers in exact round thousands (intentional, non-organic amounts — common in structured laundering)",
+            f"""WITH BankAccount, transferredTo
+FOR e IN transferredTo
+  LET remainder = e.amount - FLOOR(e.amount / 1000) * 1000
+  FILTER remainder == 0
+  FILTER e.amount >= @minAmount
+  SORT e.amount DESC
+  LIMIT @limit
+  RETURN e""",
+            {"minAmount": 100000, "limit": 25},
+            now,
+        )
+
+    # I&W 2.3: Shared Device Mule Ring
+    if "BankAccount" in vertex_colls and "DigitalLocation" in vertex_colls and "accessedFrom" in edge_colls and "transferredTo" in edge_colls:
+        _upsert_query(
+            queries_col, vp_query_col, vp_id, graph_name,
+            "[I&W] Shared Device Mule Ring",
+            "Find a single device/IP accessed by many distinct accounts (coordinated mule ring). Returns access edges so the device hub + spokes render.",
+            f"""WITH BankAccount, DigitalLocation, accessedFrom
+FOR dev IN DigitalLocation
+  LET accessors = (FOR e IN accessedFrom FILTER e._to == dev._id RETURN e)
+  FILTER LENGTH(accessors) >= @minAccounts
+  SORT LENGTH(accessors) DESC
+  LIMIT @limit
+  FOR e IN accessors
+    RETURN e""",
+            {"minAccounts": 5, "limit": 2},
+            now,
+        )
+
+    # I&W 5.1: High-Risk Aliases (Entity Resolution)
+    if "Person" in vertex_colls and "GoldenRecord" in vertex_colls and "resolvedTo" in edge_colls:
+        _upsert_query(
+            queries_col, vp_query_col, vp_id, graph_name,
+            "[I&W] Suspect Aliases (High-Risk Consolidations)",
+            "Find GoldenRecords with multiple Person aliases (benami/proxy identity pattern)",
+            f"""{with_clause}
+FOR gr IN GoldenRecord
+  LET personCount = LENGTH(FOR v, e IN 1..1 INBOUND gr resolvedTo FILTER IS_SAME_COLLECTION("Person", v) RETURN 1)
+  FILTER personCount >= 2
+  LET riskReasons = FLATTEN(
+    FOR v, e IN 1..1 INBOUND gr resolvedTo
+      FILTER IS_SAME_COLLECTION("Person", v)
+      RETURN v.riskReasons || []
+  )
+  SORT gr.riskScore DESC
+  LIMIT @limit
+  FOR v, e, p IN 1..1 INBOUND gr resolvedTo
+    FILTER IS_SAME_COLLECTION("Person", v)
+    RETURN p""",
+            {"limit": 10},
+            now,
+        )
+
+    # I&W 5.2: Risk Propagation (Guilt by Association).
+    # NOTE: WatchlistEntity has no edges in this data model — watchlist hits are
+    # recorded as riskScore/riskReasons on Person. So we seed from the highest-risk
+    # Person and walk the relatedTo (Person->Person) network. Returns paths so the
+    # seed + connected (risk-inheriting) people render.
+    if "Person" in vertex_colls and "relatedTo" in edge_colls:
+        _upsert_query(
+            queries_col, vp_query_col, vp_id, graph_name,
+            "[I&W] Risk Propagation (Guilt by Association)",
+            "Walk the associate network of the highest-risk people to surface entities that inherit risk by association",
+            f"""WITH Person, relatedTo
+FOR seed IN Person
+  FILTER seed.riskScore != null AND seed.riskScore >= @minRisk
+  SORT seed.riskScore DESC
+  LIMIT @seedLimit
+  FOR v, e, p IN 1..@depth ANY seed relatedTo
+    OPTIONS {{ uniqueVertices: "path", bfs: true }}
+    LIMIT @limit
+    RETURN p""",
+            {"minRisk": 50, "seedLimit": 3, "depth": 2, "limit": 25},
+            now,
+        )
+
 
 def install_canvas_actions(db, graph_name: str, vertex_colls: Set[str], edge_colls: Set[str]) -> None:
     """Install canvas actions. OntologyGraph uses ontology-only logic; others use generic logic."""
@@ -534,6 +699,119 @@ FOR start IN @nodes
                 "Find directed transfer cycles returning to the selected BankAccount (AQL traversal).",
                 cycle_query,
                 {"nodes": [], "maxDepth": 6, "limit": 5},
+                now,
+            )
+
+            # Upstream: trace where the money in this account CAME FROM.
+            _upsert_canvas_action(
+                canvas_col, vp_act_col, vp_id, graph_name,
+                "[BankAccount] Trace Funding Sources (upstream)",
+                "Walk inbound transfers up to N hops to reveal who funded the selected account.",
+                f"""{with_clause}
+FOR node IN @nodes
+  FILTER IS_SAME_COLLECTION("BankAccount", node)
+  FOR v, e, p IN 1..@depth INBOUND node transferredTo
+    OPTIONS {{ uniqueVertices: "path", bfs: true }}
+    LIMIT @limit
+    RETURN p""",
+                {"nodes": [], "depth": 3, "limit": 50},
+                now,
+            )
+
+            # Downstream: trace where the money WENT.
+            _upsert_canvas_action(
+                canvas_col, vp_act_col, vp_id, graph_name,
+                "[BankAccount] Trace Downstream Flow",
+                "Walk outbound transfers up to N hops to reveal where funds were moved.",
+                f"""{with_clause}
+FOR node IN @nodes
+  FILTER IS_SAME_COLLECTION("BankAccount", node)
+  FOR v, e, p IN 1..@depth OUTBOUND node transferredTo
+    OPTIONS {{ uniqueVertices: "path", bfs: true }}
+    LIMIT @limit
+    RETURN p""",
+                {"nodes": [], "depth": 3, "limit": 50},
+                now,
+            )
+
+        if v_coll == "BankAccount" and "hasAccount" in edge_colls:
+            # Pivot from an account to its owner and the owner's other accounts.
+            _upsert_canvas_action(
+                canvas_col, vp_act_col, vp_id, graph_name,
+                "[BankAccount] Show Owner & Linked Accounts",
+                "Reveal the account holder and all other accounts they control.",
+                f"""{with_clause}
+FOR node IN @nodes
+  FILTER IS_SAME_COLLECTION("BankAccount", node)
+  FOR v, e, p IN 1..2 ANY node hasAccount
+    LIMIT @limit
+    RETURN p""",
+                {"nodes": [], "limit": 50},
+                now,
+            )
+
+        if v_coll == "BankAccount" and "accessedFrom" in edge_colls:
+            # Surface accounts that share a device/IP with the selected account.
+            _upsert_canvas_action(
+                canvas_col, vp_act_col, vp_id, graph_name,
+                "[BankAccount] Show Co-Accessed Accounts (shared device)",
+                "Reveal the device/IP this account used and every other account accessed from it (mule ring detection).",
+                f"""{with_clause}
+FOR node IN @nodes
+  FILTER IS_SAME_COLLECTION("BankAccount", node)
+  FOR v, e, p IN 1..2 ANY node accessedFrom
+    LIMIT @limit
+    RETURN p""",
+                {"nodes": [], "limit": 50},
+                now,
+            )
+
+        if v_coll == "Person" and "resolvedTo" in edge_colls:
+            # Reveal hidden identities: person -> golden record -> other aliases.
+            _upsert_canvas_action(
+                canvas_col, vp_act_col, vp_id, graph_name,
+                "[Person] Reveal Aliases (Golden Record)",
+                "Pivot through the resolved Golden Record to expose other identities/aliases of this person.",
+                f"""{with_clause}
+FOR node IN @nodes
+  FILTER IS_SAME_COLLECTION("Person", node)
+  FOR v, e, p IN 1..2 ANY node resolvedTo
+    LIMIT @limit
+    RETURN p""",
+                {"nodes": [], "limit": 25},
+                now,
+            )
+
+        if v_coll == "Person" and "hasAccount" in edge_colls and "transferredTo" in edge_colls:
+            # From a person to their accounts and where those accounts send money.
+            _upsert_canvas_action(
+                canvas_col, vp_act_col, vp_id, graph_name,
+                "[Person] Show Accounts & Money Flows",
+                "Expand a person to their bank accounts and the transfers those accounts make.",
+                f"""{with_clause}
+FOR node IN @nodes
+  FILTER IS_SAME_COLLECTION("Person", node)
+  FOR v, e, p IN 1..2 OUTBOUND node hasAccount, transferredTo
+    LIMIT @limit
+    RETURN p""",
+                {"nodes": [], "limit": 50},
+                now,
+            )
+
+        if v_coll == "Person" and "relatedTo" in edge_colls:
+            # Associate network for guilt-by-association investigation.
+            _upsert_canvas_action(
+                canvas_col, vp_act_col, vp_id, graph_name,
+                "[Person] Show Associate Network",
+                "Walk the relatedTo network to surface known associates (guilt-by-association).",
+                f"""{with_clause}
+FOR node IN @nodes
+  FILTER IS_SAME_COLLECTION("Person", node)
+  FOR v, e, p IN 1..@depth ANY node relatedTo
+    OPTIONS {{ uniqueVertices: "path", bfs: true }}
+    LIMIT @limit
+    RETURN p""",
+                {"nodes": [], "depth": 2, "limit": 50},
                 now,
             )
 

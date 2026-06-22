@@ -99,16 +99,17 @@ def get_arango_config(forced_mode: Optional[str] = None) -> ArangoConfig:
     if mode not in {"LOCAL", "REMOTE"}:
         mode = "LOCAL"
 
-    # LOCAL overrides
+    # LOCAL overrides. Also accept lowercase/typo variants found in some .env
+    # files (e.g. LOCAL_ARANGO_password, LOCALARANGO_DATABASE).
     local_url = _first(os.getenv("LOCAL_ARANGO_URL"), os.getenv("LOCAL_ARANGO_ENDPOINT"))
     local_user = _first(os.getenv("LOCAL_ARANGO_USERNAME"), os.getenv("LOCAL_ARANGO_USER"))
-    local_pass = _first(os.getenv("LOCAL_ARANGO_PASSWORD"), os.getenv("LOCAL_ARANGO_PASS"))
-    local_db = _first(os.getenv("LOCAL_ARANGO_DATABASE"), os.getenv("LOCAL_ARANGO_DB"))
+    local_pass = _first(os.getenv("LOCAL_ARANGO_PASSWORD"), os.getenv("LOCAL_ARANGO_PASS"), os.getenv("LOCAL_ARANGO_password"))
+    local_db = _first(os.getenv("LOCAL_ARANGO_DATABASE"), os.getenv("LOCAL_ARANGO_DB"), os.getenv("LOCALARANGO_DATABASE"))
 
-    # REMOTE / default
+    # REMOTE / default. ARANGO_password (lowercase) accepted as a fallback.
     url = _first(os.getenv("ARANGO_URL"), os.getenv("ARANGO_ENDPOINT"))
     user = _first(os.getenv("ARANGO_USERNAME"), os.getenv("ARANGO_USER"), "root")
-    passwd = _first(os.getenv("ARANGO_PASSWORD"), os.getenv("ARANGO_PASS"), "")
+    passwd = _first(os.getenv("ARANGO_PASSWORD"), os.getenv("ARANGO_PASS"), os.getenv("ARANGO_password"), "")
     db = _first(os.getenv("ARANGO_DATABASE"), os.getenv("ARANGO_DB"), "fraud-intelligence")
 
     if mode == "LOCAL":
